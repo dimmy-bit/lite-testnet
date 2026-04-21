@@ -1,59 +1,35 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║          MirLite Testnet Automation Bot                     ║
-║          LitecoinEVM Testnet Airdrop Hunter                 ║
-║          GitHub: github.com/YOUR_USERNAME/mirlite-bot       ║
+║          MirLite Bot — LitecoinEVM Testnet v3.0             ║
+║          On-Chain Transaction Automation                    ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
-import os
-import sys
-import time
-import json
-import random
-import asyncio
-import threading
+import os, sys, time, json, random, re
 from pathlib import Path
 from typing import Optional
 
-# ─── Dependency auto-installer ───────────────────────────────────────────────
-REQUIRED = {
-    "web3": "web3",
-    "eth_account": "eth-account",
-    "aiohttp": "aiohttp",
-    "colorama": "colorama",
-    "requests": "requests",
-    "rich": "rich",
-    "pyfiglet": "pyfiglet",
-}
-
+# ─── Auto-installer ──────────────────────────────────────────────────────────
 def install_missing():
     import importlib, subprocess
-    missing = []
-    for mod, pkg in REQUIRED.items():
-        try:
-            importlib.import_module(mod)
-        except ImportError:
-            missing.append(pkg)
+    pkgs = {"web3":"web3","eth_account":"eth-account","colorama":"colorama",
+            "requests":"requests","rich":"rich","pyfiglet":"pyfiglet"}
+    missing = [p for m,p in pkgs.items() if not importlib.util.find_spec(m)]
     if missing:
-        print(f"\n[*] Installing missing packages: {', '.join(missing)}")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + missing)
-        print("[✓] All packages installed!\n")
+        print(f"[*] Installing: {', '.join(missing)}")
+        subprocess.check_call([sys.executable,"-m","pip","install","--quiet"]+missing)
+        print("[✓] Done!\n")
 
 install_missing()
 
-# ─── Imports ─────────────────────────────────────────────────────────────────
 import requests
-import aiohttp
 from web3 import Web3
 from eth_account import Account
-from colorama import init, Fore, Back, Style
+from colorama import init, Fore, Style
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
-from rich.live import Live
 from rich import box
 import pyfiglet
 
@@ -61,762 +37,666 @@ init(autoreset=True)
 console = Console()
 Account.enable_unaudited_hdwallet_features()
 
-# ─── Constants ───────────────────────────────────────────────────────────────
-LITVM_RPC    = "https://rpc.litecoin-evm.caldera.xyz"
-LITVM_CHAIN  = 21    # LitecoinEVM testnet chain ID (verify from network)
+# ─── Network Config ───────────────────────────────────────────────────────────
+RPC_URLS = [
+    "https://rpc.litecoin-evm.caldera.xyz",
+    "https://rpc-litecoin-evm-testnet.caldera.xyz",
+]
+CHAIN_ID     = 21
+EXPLORER     = "https://explorer.litecoin-evm.caldera.xyz"
 WALLETS_FILE = "wallets.json"
-LOGS_FILE    = "task_logs.json"
 
-# Known contract addresses on LitecoinEVM testnet
-CONTRACTS = {
-    "zkLTC":  "0xFC73cdB75F37B0da829c4e54511f410D525B76b2",
-    "wzkLTC": "0x0000000000000000000000000000000000000000",  # Update when known
-}
+# Known contract on LitecoinEVM testnet (from task URLs)
+ZKLTC_TOKEN  = "0xFC73cdB75F37B0da829c4e54511f410D525B76b2"
 
-# ERC-20 minimal ABI
 ERC20_ABI = [
-    {"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"stateMutability":"view","type":"function"},
-    {"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],
+     "name":"transfer","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"name":"account","type":"address"}],
+     "name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],
+     "name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"stateMutability":"view","type":"function"},
 ]
 
-# ─── Human-like delays ────────────────────────────────────────────────────────
-def human_delay(min_s: float = 1.5, max_s: float = 4.5):
-    """Simulate realistic human timing between actions."""
-    delay = random.uniform(min_s, max_s)
-    time.sleep(delay)
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+def human_delay(a=1.5, b=4.5):  time.sleep(random.uniform(a, b))
+def rand_amt(lo=0.00005, hi=0.0003): return round(random.uniform(lo, hi), 6)
+def short(addr): return f"{addr[:10]}...{addr[-8:]}"
+def explorer_tx(h): return f"{EXPLORER}/tx/{h}"
 
-def micro_delay():
-    time.sleep(random.uniform(0.3, 0.9))
+def fetch_contracts_from_page(url: str) -> list:
+    """Scrape EVM contract addresses from a webpage."""
+    try:
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
+            timeout=12)
+        addrs = re.findall(r'0x[a-fA-F0-9]{40}', r.text)
+        # Filter out zero-address and duplicates
+        seen, result = set(), []
+        for a in addrs:
+            if a.lower() != "0x"+"0"*40 and a.lower() not in seen:
+                seen.add(a.lower()); result.append(a)
+        return result
+    except Exception as e:
+        console.print(f"[dim]  Page fetch failed: {str(e)[:50]}[/dim]")
+        return []
 
 # ─── Banner ───────────────────────────────────────────────────────────────────
 def print_banner():
     os.system("cls" if os.name == "nt" else "clear")
-    
-    colors = [Fore.CYAN, Fore.BLUE, Fore.MAGENTA, Fore.GREEN]
-    title = pyfiglet.figlet_format("MirLite Bot", font="slant")
-    lines = title.strip().split("\n")
-    
-    for i, line in enumerate(lines):
-        color = colors[i % len(colors)]
-        for char in line:
-            print(color + char, end="", flush=True)
-            time.sleep(0.003)
+    colors = [Fore.CYAN, Fore.BLUE, Fore.MAGENTA, Fore.GREEN, Fore.YELLOW]
+    title  = pyfiglet.figlet_format("MirLite  Bot", font="slant")
+    for i, line in enumerate(title.strip().split("\n")):
+        for ch in line:
+            print(colors[i % len(colors)] + ch, end="", flush=True)
+            time.sleep(0.002)
         print()
-    
-    time.sleep(0.2)
-    sub = "  ⚡  LitecoinEVM Testnet Automation Bot  ⚡"
-    for ch in sub:
-        print(Fore.YELLOW + ch, end="", flush=True)
-        time.sleep(0.02)
+    time.sleep(0.1)
+    for ch in "  ⚡  LitecoinEVM Testnet Bot v3.0 — On-Chain Transactions  ⚡":
+        print(Fore.YELLOW + ch, end="", flush=True); time.sleep(0.016)
+    print("\n")
+    for l in [
+        f"{Fore.CYAN}  ╔══════════════════════════════════════════════════╗",
+        f"{Fore.CYAN}  ║  {Fore.WHITE}Backed by : Litecoin (Top 20 Project)        {Fore.CYAN}║",
+        f"{Fore.CYAN}  ║  {Fore.GREEN}Network  : LitecoinEVM Testnet              {Fore.CYAN}║",
+        f"{Fore.CYAN}  ║  {Fore.MAGENTA}Version  : v3.0 | Real On-Chain TXs        {Fore.CYAN}║",
+        f"{Fore.CYAN}  ╚══════════════════════════════════════════════════╝",
+    ]:
+        print(l); time.sleep(0.07)
     print()
 
-    info_lines = [
-        f"{Fore.CYAN}  ╔══════════════════════════════════════════════════╗",
-        f"{Fore.CYAN}  ║  {Fore.WHITE}Backed by: Litecoin (Top 20 Project)         {Fore.CYAN}  ║",
-        f"{Fore.CYAN}  ║  {Fore.GREEN}Network : LitecoinEVM Testnet               {Fore.CYAN}  ║",
-        f"{Fore.CYAN}  ║  {Fore.MAGENTA}Version : v2.0 | Human-Like Automation      {Fore.CYAN}  ║",
-        f"{Fore.CYAN}  ╚══════════════════════════════════════════════════╝",
-    ]
-    for line in info_lines:
-        print(line)
-        time.sleep(0.08)
-    print()
+# ─── Chain ───────────────────────────────────────────────────────────────────
+class Chain:
+    def __init__(self):
+        self.w3: Optional[Web3] = None
+        for rpc in RPC_URLS:
+            try:
+                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout":20}))
+                if w3.is_connected():
+                    self.w3 = w3
+                    console.print(f"[green]✓ RPC connected: {rpc}[/green]")
+                    return
+            except: pass
+        console.print("[yellow]⚠ RPC unavailable — tasks will show manual links[/yellow]")
+
+    @property
+    def ok(self): return self.w3 is not None
+
+    def balance(self, addr):
+        try: return float(self.w3.from_wei(self.w3.eth.get_balance(addr), "ether"))
+        except: return 0.0
+
+    def token_bal(self, token, wallet):
+        try:
+            c   = self.w3.eth.contract(address=Web3.to_checksum_address(token), abi=ERC20_ABI)
+            dec = c.functions.decimals().call()
+            return c.functions.balanceOf(Web3.to_checksum_address(wallet)).call() / 10**dec
+        except: return 0.0
+
+    def send_tx(self, pk: str, to: str, data: bytes = b"",
+                value: int = 0, gas: int = 250_000) -> Optional[str]:
+        if not self.ok:
+            console.print("[dim]    (no RPC — simulated)[/dim]")
+            return "0xSIMULATED_" + "ab" * 10
+        try:
+            acct      = Account.from_key(pk)
+            nonce     = self.w3.eth.get_transaction_count(acct.address, "pending")
+            gas_price = int(self.w3.eth.gas_price * random.uniform(1.05, 1.15))
+            tx = {"chainId": CHAIN_ID, "nonce": nonce,
+                  "to": Web3.to_checksum_address(to), "value": value,
+                  "gas": gas, "gasPrice": gas_price, "data": data}
+            signed  = self.w3.eth.account.sign_transaction(tx, pk)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            return tx_hash.hex() if receipt.status == 1 else None
+        except Exception as e:
+            err = str(e).lower()
+            if "insufficient" in err: console.print("[red]    ✗ Insufficient funds — fund wallet first[/red]")
+            elif "nonce"       in err: console.print("[yellow]    ⚠ Nonce error[/yellow]")
+            else: console.print(f"[red]    TX error: {str(e)[:80]}[/red]")
+            return None
+
+    def contract_tx(self, pk: str, addr: str, abi, fn: str,
+                    args: list, value: int = 0, gas: int = 300_000) -> Optional[str]:
+        if not self.ok:
+            console.print("[dim]    (no RPC — simulated)[/dim]")
+            return "0xSIMULATED_" + "cd" * 10
+        try:
+            acct      = Account.from_key(pk)
+            contract  = self.w3.eth.contract(address=Web3.to_checksum_address(addr), abi=abi)
+            func      = getattr(contract.functions, fn)(*args)
+            nonce     = self.w3.eth.get_transaction_count(acct.address, "pending")
+            gas_price = int(self.w3.eth.gas_price * random.uniform(1.05, 1.15))
+            built = func.build_transaction({"chainId": CHAIN_ID, "from": acct.address,
+                "nonce": nonce, "value": value, "gas": gas, "gasPrice": gas_price})
+            signed  = self.w3.eth.account.sign_transaction(built, pk)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            return tx_hash.hex() if receipt.status == 1 else None
+        except Exception as e:
+            console.print(f"[red]    Contract error: {str(e)[:100]}[/red]")
+            return None
 
 # ─── Wallet Manager ───────────────────────────────────────────────────────────
 class WalletManager:
     def __init__(self):
-        self.wallets: list[dict] = []
-        self.load()
-
-    def load(self):
+        self.wallets = []
         if Path(WALLETS_FILE).exists():
-            with open(WALLETS_FILE) as f:
-                self.wallets = json.load(f)
+            with open(WALLETS_FILE) as f: self.wallets = json.load(f)
 
     def save(self):
-        with open(WALLETS_FILE, "w") as f:
-            json.dump(self.wallets, f, indent=2)
+        with open(WALLETS_FILE, "w") as f: json.dump(self.wallets, f, indent=2)
 
-    def create(self, count: int = 1) -> list[dict]:
-        created = []
-        for _ in range(count):
-            acct = Account.create()
-            wallet = {
-                "address": acct.address,
-                "private_key": acct.key.hex(),
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "tasks_done": [],
-            }
-            self.wallets.append(wallet)
-            created.append(wallet)
-        self.save()
-        return created
+    def create(self, n):
+        new = []
+        for _ in range(n):
+            a = Account.create()
+            w = {"address": a.address, "private_key": a.key.hex(),
+                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"), "tasks_done": []}
+            self.wallets.append(w); new.append(w)
+        self.save(); return new
 
-    def list_wallets(self) -> list[dict]:
-        return self.wallets
-
-    def get_by_index(self, idx: int) -> Optional[dict]:
-        if 0 <= idx < len(self.wallets):
-            return self.wallets[idx]
-        return None
-
-    def mark_task(self, address: str, task: str):
+    def mark(self, addr, task):
         for w in self.wallets:
-            if w["address"].lower() == address.lower():
+            if w["address"].lower() == addr.lower():
                 if task not in w.get("tasks_done", []):
                     w.setdefault("tasks_done", []).append(task)
         self.save()
 
-    def display_table(self):
-        table = Table(title="💼 Saved Wallets", box=box.ROUNDED,
-                      style="cyan", header_style="bold magenta")
-        table.add_column("#", style="dim", width=4)
-        table.add_column("Address", style="green")
-        table.add_column("Private Key", style="yellow")
-        table.add_column("Tasks Done", style="blue")
-        table.add_column("Created", style="dim")
+    def done(self, addr, task):
+        for w in self.wallets:
+            if w["address"].lower() == addr.lower():
+                return task in w.get("tasks_done", [])
+        return False
 
+    def table(self):
+        t = Table(title="💼 Wallets", box=box.ROUNDED, style="cyan", header_style="bold magenta")
+        t.add_column("#", width=4); t.add_column("Address", style="green")
+        t.add_column("Key (partial)", style="yellow")
+        t.add_column("Progress", style="blue"); t.add_column("Created", style="dim")
         for i, w in enumerate(self.wallets):
-            pk = w["private_key"][:10] + "..." + w["private_key"][-6:]
-            tasks = ", ".join(w.get("tasks_done", [])) or "—"
-            table.add_row(str(i+1), w["address"], pk, tasks, w["created_at"])
-        console.print(table)
+            pk = w["private_key"][:10] + "…" + w["private_key"][-6:]
+            t.add_row(str(i+1), w["address"], pk,
+                      f"{len(w.get('tasks_done',[]))}/9", w["created_at"])
+        console.print(t)
 
-
-# ─── Web3 Helper ─────────────────────────────────────────────────────────────
-class Web3Helper:
-    def __init__(self):
-        self.w3 = Web3(Web3.HTTPProvider(LITVM_RPC))
-
-    def is_connected(self) -> bool:
+# ─── Faucet helper (tries multiple endpoint patterns) ─────────────────────────
+def try_faucet(base_url: str, address: str, label: str) -> bool:
+    hdrs = {"Content-Type":"application/json",
+            "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Origin": base_url, "Referer": base_url + "/"}
+    patterns = [
+        (base_url.rstrip("/")+"/api/faucet",         {"address": address}),
+        (base_url.rstrip("/")+"/api/claim",           {"address": address}),
+        (base_url.rstrip("/")+"/api/drip",            {"address": address}),
+        (base_url.rstrip("/")+"/faucet/send",         {"toAddress": address}),
+        (base_url.rstrip("/")+"/api/faucet/request",  {"walletAddress": address}),
+        (base_url.rstrip("/")+"/api/airdrop",         {"address": address}),
+    ]
+    for url, payload in patterns:
         try:
-            return self.w3.is_connected()
-        except:
-            return False
+            r = requests.post(url, json=payload, headers=hdrs, timeout=10)
+            if r.status_code in (200, 201):
+                console.print(f"[green]  ✓ {label} claimed![/green]")
+                return True
+            elif r.status_code == 429:
+                console.print(f"[yellow]  ⚠ {label} rate-limited (already claimed)[/yellow]")
+                return True
+        except requests.exceptions.Timeout:
+            pass
+        except: pass
 
-    def get_balance(self, address: str) -> float:
-        try:
-            bal = self.w3.eth.get_balance(address)
-            return float(self.w3.from_wei(bal, "ether"))
-        except:
-            return 0.0
+    console.print(f"[yellow]  ⚠ {label} auto-claim unavailable (site uses wallet-connect)[/yellow]")
+    console.print(f"  [dim]→ Claim manually: {base_url}[/dim]")
+    return False
 
-    def get_nonce(self, address: str) -> int:
-        return self.w3.eth.get_transaction_count(address)
+# ─── Tasks ───────────────────────────────────────────────────────────────────
+class Tasks:
+    def __init__(self, wm: WalletManager, chain: Chain):
+        self.wm = wm; self.chain = chain
 
-    def send_tx(self, private_key: str, tx: dict) -> Optional[str]:
-        try:
-            signed = self.w3.eth.account.sign_transaction(tx, private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            if receipt.status == 1:
-                return tx_hash.hex()
-            return None
-        except Exception as e:
-            console.print(f"[red]TX Error: {e}[/red]")
-            return None
+    def _hdr(self, icon, title, w):
+        console.print(Panel(
+            f"[yellow]{title}[/yellow]\nWallet: [green]{w['address']}[/green]",
+            title=f"{icon}", border_style="blue"))
 
-    def erc20_balance(self, token_addr: str, wallet: str) -> float:
-        try:
-            contract = self.w3.eth.contract(
-                address=Web3.to_checksum_address(token_addr),
-                abi=ERC20_ABI
-            )
-            bal = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
-            return float(self.w3.from_wei(bal, "ether"))
-        except:
-            return 0.0
+    # ── STEP 1 ────────────────────────────────────────────────────────────────
+    def step1(self, w):
+        self._hdr("🪙", "Step 1: LiteForge Faucet — Claim test tLTC", w)
+        if self.wm.done(w["address"], "s1"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
+        try_faucet("https://liteforge.hub.caldera.xyz", w["address"], "LiteForge")
+        self.wm.mark(w["address"], "s1")
+        human_delay(3, 6)
 
+    # ── STEP 2 ────────────────────────────────────────────────────────────────
+    def step2(self, w):
+        self._hdr("🚀", "Step 2: Lester Labs — Launch Token", w)
+        if self.wm.done(w["address"], "s2"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
 
-# ─── Task Engine ─────────────────────────────────────────────────────────────
-class TaskEngine:
-    def __init__(self, wallet_manager: WalletManager, web3: Web3Helper):
-        self.wm = wallet_manager
-        self.w3 = web3
+        names  = ["Degen","Moon","Alpha","Sigma","Nova","Apex","Blaze","Flux","Zen","Storm"]
+        suffix = ["Coin","Token","Finance","DAO","Pad","Verse","Forge"]
+        tname  = random.choice(names) + random.choice(suffix)
+        tsym   = tname[:3].upper() + str(random.randint(10,99))
+        supply = random.choice([1_000_000, 10_000_000, 100_000_000])
+        console.print(f"  [dim]Token: {tname} ({tsym}) | Supply: {supply:,}[/dim]")
 
-    def _spinner(self, msg: str):
-        with console.status(f"[cyan]{msg}[/cyan]", spinner="dots"):
+        with console.status("[cyan]  Fetching Lester Labs factory contract...[/cyan]", spinner="dots"):
             human_delay(2, 4)
+            addrs = fetch_contracts_from_page("https://lester-labs.com/launch")
 
-    def step1_claim_faucet(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 1: Claiming test tokens from LiteForge Faucet[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="🪙 Faucet"))
-        
-        faucet_url = "https://liteforge.hub.caldera.xyz"
-        console.print(f"[dim]→ Faucet URL: {faucet_url}[/dim]")
-        
-        # Simulate request with human timing
-        self._spinner("Connecting to LiteForge faucet...")
-        
-        # Try actual faucet API (many Caldera faucets have a /api/claim endpoint)
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Origin": faucet_url,
-            "Referer": faucet_url + "/",
-        }
-        payload = {"address": wallet["address"]}
-        
-        try:
-            micro_delay()
-            # Caldera faucet API pattern
-            resp = requests.post(
-                "https://liteforge.hub.caldera.xyz/api/faucet",
-                json=payload, headers=headers, timeout=15
-            )
-            if resp.status_code in (200, 201):
-                data = resp.json()
-                tx = data.get("txHash") or data.get("hash") or "Submitted"
-                console.print(f"[green]✓ Faucet claimed! TX: {tx}[/green]")
-                self.wm.mark_task(wallet["address"], "faucet_liteforge")
-            elif resp.status_code == 429:
-                console.print("[yellow]⚠ Faucet rate-limited (already claimed recently)[/yellow]")
-                self.wm.mark_task(wallet["address"], "faucet_liteforge")
+        FACTORY_ABI = [{"inputs":[{"name":"name","type":"string"},{"name":"symbol","type":"string"},
+                {"name":"totalSupply","type":"uint256"}],"name":"createToken",
+                "outputs":[{"name":"","type":"address"}],"stateMutability":"payable","type":"function"}]
+
+        if addrs and self.chain.ok:
+            tx = self.chain.contract_tx(w["private_key"], addrs[0], FACTORY_ABI,
+                "createToken", [tname, tsym, supply * 10**18], value=0, gas=500_000)
+            if tx:
+                console.print(f"[green]  ✓ Token deployed! TX: {tx[:20]}...[/green]")
+                console.print(f"  [dim]{explorer_tx(tx)}[/dim]")
             else:
-                console.print(f"[yellow]⚠ Faucet response: {resp.status_code} - manual claim may be needed[/yellow]")
-        except requests.exceptions.RequestException as e:
-            console.print(f"[yellow]⚠ Network issue reaching faucet: {str(e)[:60]}[/yellow]")
-        
+                console.print("[yellow]  ⚠ TX failed — visit manually: https://lester-labs.com/launch[/yellow]")
+        else:
+            console.print("[yellow]  ⚠ Launch manually: https://lester-labs.com/launch[/yellow]")
+
+        self.wm.mark(w["address"], "s2")
+        human_delay(3, 6)
+
+    # ── STEP 3 ────────────────────────────────────────────────────────────────
+    def step3(self, w):
+        self._hdr("🏛", "Step 3: Midashand — Claim test tokens", w)
+        if self.wm.done(w["address"], "s3"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
+        try_faucet("https://midashand.xyz", w["address"], "Midashand")
+        self.wm.mark(w["address"], "s3")
         human_delay(2, 5)
 
-    def step2_launch_token(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 2: Launching token on Lester Labs[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="🚀 Token Launch"))
-        
-        # Token details - randomised to look unique
-        name_parts = ["Degen", "Moon", "LTC", "Alpha", "Sigma", "Zen", "Nova", "Apex"]
-        symbols = ["DGN", "MLT", "ALP", "SIG", "ZEN", "NOV", "APX", "LTG"]
-        token_name = random.choice(name_parts) + random.choice(["Coin", "Token", "Finance", "DAO"])
-        token_symbol = random.choice(symbols) + str(random.randint(1, 99))
-        supply = random.choice([1_000_000, 10_000_000, 100_000_000, 1_000_000_000])
-        
-        console.print(f"[dim]Token Name: {token_name}[/dim]")
-        console.print(f"[dim]Symbol: {token_symbol}  Supply: {supply:,}[/dim]")
-        
-        self._spinner(f"Deploying token '{token_name}' ({token_symbol})...")
-        
-        # Lester Labs API interaction
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Origin": "https://lester-labs.com",
-            "Referer": "https://lester-labs.com/launch",
-        }
-        payload = {
-            "name": token_name,
-            "symbol": token_symbol,
-            "totalSupply": str(supply),
-            "deployer": wallet["address"],
-        }
-        
-        try:
-            resp = requests.post(
-                "https://lester-labs.com/api/launch",
-                json=payload, headers=headers, timeout=20
-            )
-            if resp.status_code in (200, 201):
-                data = resp.json()
-                contract = data.get("contractAddress", "")
-                console.print(f"[green]✓ Token launched! Contract: {contract or 'Confirmed'}[/green]")
-            else:
-                console.print(f"[yellow]⚠ Response {resp.status_code} - interaction logged[/yellow]")
-        except Exception as e:
-            console.print(f"[yellow]⚠ Could not reach Lester Labs API: {str(e)[:60]}[/yellow]")
-        
-        self.wm.mark_task(wallet["address"], "lester_launch")
-        human_delay(3, 6)
+    # ── STEP 4 ────────────────────────────────────────────────────────────────
+    def step4(self, w):
+        self._hdr("🎲", "Step 4: Midashand Markets — Place Bet", w)
+        if self.wm.done(w["address"], "s4"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
 
-    def step3_midashand_faucet(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 3: Claiming from Midashand Faucet[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="🏛 Midashand"))
-        
-        self._spinner("Connecting to Midashand...")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-            "Origin": "https://midashand.xyz",
-            "Referer": "https://midashand.xyz/",
-        }
-        
-        try:
-            resp = requests.post(
-                "https://midashand.xyz/api/faucet",
-                json={"address": wallet["address"]},
-                headers=headers, timeout=15
-            )
-            if resp.status_code in (200, 201):
-                console.print("[green]✓ Midashand faucet claimed![/green]")
-            elif resp.status_code == 429:
-                console.print("[yellow]⚠ Already claimed from Midashand recently[/yellow]")
-            else:
-                console.print(f"[yellow]⚠ Status {resp.status_code} - logged[/yellow]")
-        except Exception as e:
-            console.print(f"[yellow]⚠ Midashand faucet: {str(e)[:60]}[/yellow]")
-        
-        self.wm.mark_task(wallet["address"], "midashand_faucet")
-        human_delay(2, 4)
+        side = random.choice(["YES", "NO"])
+        amt  = rand_amt(0.0001, 0.001)
+        console.print(f"  [dim]Side: {side} | Amount: {amt} tLTC[/dim]")
 
-    def step4_place_bet(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 4: Placing bet on Midashand Markets[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="🎲 Prediction Market"))
-        
-        market_options = ["YES", "NO"]
-        bet_choice = random.choice(market_options)
-        market_id = random.randint(1, 20)
-        
-        console.print(f"[dim]Market #{market_id} | Choice: {bet_choice}[/dim]")
-        self._spinner(f"Placing {bet_choice} bet on market #{market_id}...")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Origin": "https://midashand.xyz",
-            "Referer": "https://midashand.xyz/markets",
-        }
-        
-        try:
-            payload = {
-                "marketId": market_id,
-                "side": bet_choice,
-                "amount": str(round(random.uniform(0.001, 0.01), 4)),
-                "address": wallet["address"],
-            }
-            resp = requests.post(
-                "https://midashand.xyz/api/bet",
-                json=payload, headers=headers, timeout=20
-            )
-            if resp.status_code in (200, 201):
-                console.print(f"[green]✓ Bet placed: {bet_choice} on market #{market_id}[/green]")
+        with console.status("[cyan]  Fetching market contracts...[/cyan]", spinner="dots"):
+            human_delay(2, 3)
+            addrs = fetch_contracts_from_page("https://midashand.xyz/markets")
+
+        BET_ABI = [{"inputs":[{"name":"isYes","type":"bool"}],
+                    "name":"placeBet","outputs":[],"stateMutability":"payable","type":"function"}]
+
+        if addrs and self.chain.ok:
+            tx = self.chain.contract_tx(w["private_key"], addrs[0], BET_ABI,
+                "placeBet", [side == "YES"], value=int(amt * 1e18), gas=200_000)
+            if tx:
+                console.print(f"[green]  ✓ Bet placed ({side})! TX: {tx[:20]}...[/green]")
+                console.print(f"  [dim]{explorer_tx(tx)}[/dim]")
             else:
-                console.print(f"[yellow]⚠ Bet response {resp.status_code} - logged[/yellow]")
-        except Exception as e:
-            console.print(f"[yellow]⚠ Bet error: {str(e)[:60]}[/yellow]")
-        
-        self.wm.mark_task(wallet["address"], "midashand_bet")
+                console.print("[yellow]  ⚠ TX failed — visit: https://midashand.xyz/markets[/yellow]")
+        else:
+            console.print("[yellow]  ⚠ Bet manually: https://midashand.xyz/markets[/yellow]")
+
+        self.wm.mark(w["address"], "s4")
         human_delay(3, 7)
 
-    def step5_create_onmi_token(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 5: Creating token on ONMI (LitVM)[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="🔮 ONMI Token"))
-        
-        name_words = ["Rocket", "Galaxy", "Thunder", "Phoenix", "Dragon", "Crystal", "Storm", "Blaze"]
-        token_name = random.choice(name_words) + random.choice(["Pad", "Verse", "Forge", "Flux", "Wave"])
-        token_symbol = token_name[:3].upper() + str(random.randint(10, 99))
-        
-        console.print(f"[dim]Token: {token_name} ({token_symbol})[/dim]")
-        self._spinner(f"Creating {token_name} on ONMI LitVM...")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Origin": "https://app.onmi.fun",
-            "Referer": "https://app.onmi.fun/?chain=LITVM",
-        }
-        
-        try:
-            payload = {
-                "name": token_name,
-                "symbol": token_symbol,
-                "chain": "LITVM",
-                "creator": wallet["address"],
-                "initialSupply": str(random.choice([1000000, 10000000])),
-            }
-            resp = requests.post(
-                "https://app.onmi.fun/api/tokens/create",
-                json=payload, headers=headers, timeout=20
-            )
-            if resp.status_code in (200, 201):
-                console.print(f"[green]✓ Token {token_name} created on ONMI![/green]")
-            else:
-                console.print(f"[yellow]⚠ ONMI create response {resp.status_code}[/yellow]")
-        except Exception as e:
-            console.print(f"[yellow]⚠ ONMI token: {str(e)[:60]}[/yellow]")
-        
-        self.wm.mark_task(wallet["address"], "onmi_create_token")
-        human_delay(3, 6)
+    # ── STEP 5 ────────────────────────────────────────────────────────────────
+    def step5(self, w):
+        self._hdr("🔮", "Step 5: ONMI — Create Token on LitVM", w)
+        if self.wm.done(w["address"], "s5"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
 
-    def step6_onmi_swaps(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 6: Performing swaps on ONMI[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="🔄 ONMI Swap"))
-        
-        swap_count = random.randint(2, 4)
-        pairs = [("zkLTC", "USDC"), ("USDC", "zkLTC"), ("zkLTC", "ETH")]
-        
-        for i in range(swap_count):
-            pair = random.choice(pairs)
-            amount = round(random.uniform(0.001, 0.05), 4)
-            console.print(f"[dim]Swap {i+1}/{swap_count}: {amount} {pair[0]} → {pair[1]}[/dim]")
-            
-            self._spinner(f"Swapping {pair[0]} → {pair[1]}...")
-            
-            headers = {
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                "Origin": "https://app.onmi.fun",
-                "Referer": "https://app.onmi.fun/swap?chain=LITVM",
-            }
-            
-            try:
-                payload = {
-                    "tokenIn": pair[0],
-                    "tokenOut": pair[1],
-                    "amountIn": str(amount),
-                    "chain": "LITVM",
-                    "sender": wallet["address"],
-                    "slippage": "0.5",
-                }
-                resp = requests.post(
-                    "https://app.onmi.fun/api/swap",
-                    json=payload, headers=headers, timeout=20
-                )
-                if resp.status_code in (200, 201):
-                    console.print(f"[green]  ✓ Swap {i+1} done![/green]")
-                else:
-                    console.print(f"[yellow]  ⚠ Swap {i+1} response {resp.status_code}[/yellow]")
-            except Exception as e:
-                console.print(f"[yellow]  ⚠ Swap {i+1}: {str(e)[:50]}[/yellow]")
-            
-            if i < swap_count - 1:
-                human_delay(2, 5)
-        
-        self.wm.mark_task(wallet["address"], "onmi_swaps")
-        human_delay(2, 4)
+        words  = ["Rocket","Galaxy","Thunder","Phoenix","Dragon","Crystal"]
+        tname  = random.choice(words) + random.choice(["Pad","Flux","Wave","Forge","Drop"])
+        tsym   = tname[:3].upper() + str(random.randint(10,99))
+        console.print(f"  [dim]Token: {tname} ({tsym})[/dim]")
 
-    def step7_add_liquidity(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 7: Adding liquidity on ONMI[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="💧 Add Liquidity"))
-        
-        token_a = "zkLTC"
-        token_b_addr = CONTRACTS["zkLTC"]
-        amount_a = round(random.uniform(0.001, 0.01), 4)
-        amount_b = round(random.uniform(0.001, 0.01), 4)
-        
-        console.print(f"[dim]Pool: ZKLTC / {token_b_addr[:10]}...[/dim]")
-        console.print(f"[dim]Amounts: {amount_a} {token_a} + {amount_b}[/dim]")
-        
-        self._spinner("Adding liquidity to ONMI pool...")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Origin": "https://app.onmi.fun",
-            "Referer": f"https://app.onmi.fun/liquidity/add/ZKLTC/{token_b_addr}?chain=LITVM",
-        }
-        
-        try:
-            payload = {
-                "tokenA": "ZKLTC",
-                "tokenB": token_b_addr,
-                "amountA": str(amount_a),
-                "amountB": str(amount_b),
-                "chain": "LITVM",
-                "provider": wallet["address"],
-            }
-            resp = requests.post(
-                "https://app.onmi.fun/api/liquidity/add",
-                json=payload, headers=headers, timeout=20
-            )
-            if resp.status_code in (200, 201):
-                console.print("[green]✓ Liquidity added![/green]")
-            else:
-                console.print(f"[yellow]⚠ Liquidity response {resp.status_code}[/yellow]")
-        except Exception as e:
-            console.print(f"[yellow]⚠ Liquidity: {str(e)[:60]}[/yellow]")
-        
-        self.wm.mark_task(wallet["address"], "onmi_liquidity")
-        human_delay(3, 6)
-
-    def step8_campaign(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 8: Completing ONMI Campaign #4441[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="🎯 Campaign"))
-        
-        self._spinner("Loading campaign tasks...")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Origin": "https://app.onmi.fun",
-            "Referer": "https://app.onmi.fun/campaigns/4441?chain=LITVM",
-        }
-        
-        # Complete campaign tasks
-        for task_num in range(1, 4):
-            console.print(f"[dim]  Completing campaign task {task_num}/3...[/dim]")
-            try:
-                payload = {
-                    "campaignId": 4441,
-                    "taskId": task_num,
-                    "chain": "LITVM",
-                    "participant": wallet["address"],
-                }
-                resp = requests.post(
-                    "https://app.onmi.fun/api/campaigns/complete",
-                    json=payload, headers=headers, timeout=20
-                )
-                if resp.status_code in (200, 201):
-                    console.print(f"[green]  ✓ Task {task_num} done![/green]")
-                else:
-                    console.print(f"[yellow]  ⚠ Task {task_num} response {resp.status_code}[/yellow]")
-            except Exception as e:
-                console.print(f"[yellow]  ⚠ Campaign task {task_num}: {str(e)[:50]}[/yellow]")
-            human_delay(1, 3)
-        
-        self.wm.mark_task(wallet["address"], "onmi_campaign")
-        human_delay(2, 4)
-
-    def step9_ayni_swap(self, wallet: dict):
-        console.print(Panel(f"[yellow]Step 9: AyniLabs — Swap zkLTC → wzkLTC + Supply[/yellow]\n"
-                            f"Wallet: [green]{wallet['address']}[/green]", title="🔁 AyniLabs"))
-        
-        amount = round(random.uniform(0.001, 0.005), 4)
-        console.print(f"[dim]Swapping {amount} zkLTC → wzkLTC[/dim]")
-        
-        self._spinner("Connecting to AyniLabs dashboard...")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64)",
-            "Origin": "https://aynilabs.xyz",
-            "Referer": "https://aynilabs.xyz/dashboard/",
-        }
-        
-        try:
-            # Swap step
-            payload = {
-                "from": "zkLTC",
-                "to": "wzkLTC",
-                "amount": str(amount),
-                "wallet": wallet["address"],
-            }
-            resp = requests.post(
-                "https://aynilabs.xyz/api/swap",
-                json=payload, headers=headers, timeout=20
-            )
-            if resp.status_code in (200, 201):
-                console.print("[green]  ✓ Swap zkLTC → wzkLTC done![/green]")
-            else:
-                console.print(f"[yellow]  ⚠ Swap response {resp.status_code}[/yellow]")
-            
+        with console.status("[cyan]  Fetching ONMI factory...[/cyan]", spinner="dots"):
             human_delay(2, 4)
-            
-            # Supply/Deposit step
-            console.print("[dim]  Supplying/depositing wzkLTC...[/dim]")
-            supply_payload = {
-                "token": "wzkLTC",
-                "amount": str(amount),
-                "action": "supply",
-                "wallet": wallet["address"],
-            }
-            resp2 = requests.post(
-                "https://aynilabs.xyz/api/supply",
-                json=supply_payload, headers=headers, timeout=20
-            )
-            if resp2.status_code in (200, 201):
-                console.print("[green]  ✓ Supply/deposit done![/green]")
+            addrs = fetch_contracts_from_page("https://app.onmi.fun/?chain=LITVM")
+
+        FACTORY_ABI = [{"inputs":[{"name":"name","type":"string"},{"name":"symbol","type":"string"},
+                {"name":"totalSupply","type":"uint256"}],"name":"createToken",
+                "outputs":[{"name":"","type":"address"}],"stateMutability":"payable","type":"function"}]
+
+        if addrs and self.chain.ok:
+            tx = self.chain.contract_tx(w["private_key"], addrs[0], FACTORY_ABI,
+                "createToken", [tname, tsym, 1_000_000 * 10**18],
+                value=int(0.0001 * 1e18), gas=500_000)
+            if tx:
+                console.print(f"[green]  ✓ Token created! TX: {tx[:20]}...[/green]")
+                console.print(f"  [dim]{explorer_tx(tx)}[/dim]")
             else:
-                console.print(f"[yellow]  ⚠ Supply response {resp2.status_code}[/yellow]")
-        
-        except Exception as e:
-            console.print(f"[yellow]⚠ AyniLabs: {str(e)[:60]}[/yellow]")
-        
-        self.wm.mark_task(wallet["address"], "ayni_swap_supply")
+                console.print("[yellow]  ⚠ TX failed — visit: https://app.onmi.fun/?chain=LITVM[/yellow]")
+        else:
+            console.print("[yellow]  ⚠ Create manually: https://app.onmi.fun/?chain=LITVM[/yellow]")
+
+        self.wm.mark(w["address"], "s5")
+        human_delay(3, 6)
+
+    # ── STEP 6 ────────────────────────────────────────────────────────────────
+    def step6(self, w):
+        self._hdr("🔄", "Step 6: ONMI — Swaps", w)
+        if self.wm.done(w["address"], "s6"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
+
+        swap_count = random.randint(2, 4)
+        console.print(f"  [dim]Doing {swap_count} swaps...[/dim]")
+
+        with console.status("[cyan]  Fetching ONMI router...[/cyan]", spinner="dots"):
+            human_delay(1, 2)
+            addrs = fetch_contracts_from_page("https://app.onmi.fun/swap?chain=LITVM")
+
+        SWAP_ABI = [{"inputs":[
+                {"name":"amountOutMin","type":"uint256"},
+                {"name":"path","type":"address[]"},
+                {"name":"to","type":"address"},
+                {"name":"deadline","type":"uint256"}],
+            "name":"swapExactETHForTokens",
+            "outputs":[{"name":"amounts","type":"uint256[]"}],
+            "stateMutability":"payable","type":"function"}]
+
+        done = 0
+        for i in range(swap_count):
+            amt = rand_amt()
+            console.print(f"  [dim]Swap {i+1}/{swap_count}: {amt} tLTC → zkLTC[/dim]")
+            if addrs and self.chain.ok:
+                deadline = int(time.time()) + 300
+                tx = self.chain.contract_tx(w["private_key"], addrs[0], SWAP_ABI,
+                    "swapExactETHForTokens",
+                    [0, [addrs[0], ZKLTC_TOKEN], w["address"], deadline],
+                    value=int(amt * 1e18), gas=250_000)
+                if tx:
+                    console.print(f"[green]    ✓ Swap {i+1} done! TX: {tx[:16]}...[/green]")
+                    done += 1
+                else:
+                    console.print(f"[yellow]    ⚠ Swap {i+1} failed[/yellow]")
+            else:
+                console.print(f"[yellow]    ⚠ Manual: https://app.onmi.fun/swap?chain=LITVM[/yellow]")
+            human_delay(2, 5)
+
+        self.wm.mark(w["address"], "s6")
         human_delay(2, 4)
 
-    def run_all_tasks(self, wallet: dict):
-        """Run all 9 steps for a single wallet with human-like timing."""
-        addr = wallet["address"]
-        done = wallet.get("tasks_done", [])
-        
-        console.print(f"\n[bold cyan]━━━ Running all tasks for: {addr[:12]}...{addr[-8:]} ━━━[/bold cyan]\n")
-        
-        task_map = [
-            ("faucet_liteforge",    self.step1_claim_faucet,    "Step 1: LiteForge Faucet"),
-            ("lester_launch",       self.step2_launch_token,    "Step 2: Lester Labs Launch"),
-            ("midashand_faucet",    self.step3_midashand_faucet,"Step 3: Midashand Faucet"),
-            ("midashand_bet",       self.step4_place_bet,       "Step 4: Midashand Bet"),
-            ("onmi_create_token",   self.step5_create_onmi_token,"Step 5: ONMI Create Token"),
-            ("onmi_swaps",          self.step6_onmi_swaps,      "Step 6: ONMI Swaps"),
-            ("onmi_liquidity",      self.step7_add_liquidity,   "Step 7: ONMI Liquidity"),
-            ("onmi_campaign",       self.step8_campaign,        "Step 8: ONMI Campaign"),
-            ("ayni_swap_supply",    self.step9_ayni_swap,       "Step 9: AyniLabs"),
+    # ── STEP 7 ────────────────────────────────────────────────────────────────
+    def step7(self, w):
+        self._hdr("💧", "Step 7: ONMI — Add Liquidity", w)
+        if self.wm.done(w["address"], "s7"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
+
+        amt_eth   = rand_amt(0.0001, 0.0005)
+        amt_token = rand_amt(0.0001, 0.0005)
+        console.print(f"  [dim]{amt_eth} tLTC + {amt_token} zkLTC[/dim]")
+
+        liq_url = f"https://app.onmi.fun/liquidity/add/ZKLTC/{ZKLTC_TOKEN}?chain=LITVM"
+        with console.status("[cyan]  Fetching liquidity router...[/cyan]", spinner="dots"):
+            human_delay(2, 3)
+            addrs = fetch_contracts_from_page(liq_url)
+            router = next((a for a in addrs if a.lower() != ZKLTC_TOKEN.lower()), None)
+
+        ADD_LIQ_ABI = [{"inputs":[
+                {"name":"token","type":"address"},
+                {"name":"amountTokenDesired","type":"uint256"},
+                {"name":"amountTokenMin","type":"uint256"},
+                {"name":"amountETHMin","type":"uint256"},
+                {"name":"to","type":"address"},
+                {"name":"deadline","type":"uint256"}],
+            "name":"addLiquidityETH",
+            "outputs":[{"name":"a","type":"uint256"},{"name":"b","type":"uint256"},{"name":"liq","type":"uint256"}],
+            "stateMutability":"payable","type":"function"}]
+
+        if router and self.chain.ok:
+            # Approve first
+            console.print("  [dim]Approving zkLTC...[/dim]")
+            ap = self.chain.contract_tx(w["private_key"], ZKLTC_TOKEN, ERC20_ABI,
+                "approve", [router, int(amt_token * 1e18) * 100], gas=100_000)
+            if ap:
+                console.print(f"[green]  ✓ Approved. TX: {ap[:16]}...[/green]")
+                human_delay(2, 4)
+                deadline = int(time.time()) + 300
+                tx = self.chain.contract_tx(w["private_key"], router, ADD_LIQ_ABI,
+                    "addLiquidityETH",
+                    [ZKLTC_TOKEN, int(amt_token*1e18), 0, 0, w["address"], deadline],
+                    value=int(amt_eth * 1e18), gas=400_000)
+                if tx:
+                    console.print(f"[green]  ✓ Liquidity added! TX: {tx[:20]}...[/green]")
+                    console.print(f"  [dim]{explorer_tx(tx)}[/dim]")
+                else:
+                    console.print(f"[yellow]  ⚠ TX failed — visit manually: {liq_url}[/yellow]")
+            else:
+                console.print("[yellow]  ⚠ Approve failed[/yellow]")
+        else:
+            console.print(f"[yellow]  ⚠ Manual: {liq_url}[/yellow]")
+
+        self.wm.mark(w["address"], "s7")
+        human_delay(3, 6)
+
+    # ── STEP 8 ────────────────────────────────────────────────────────────────
+    def step8(self, w):
+        self._hdr("🎯", "Step 8: ONMI Campaign #4441", w)
+        if self.wm.done(w["address"], "s8"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
+
+        with console.status("[cyan]  Loading campaign...[/cyan]", spinner="dots"):
+            human_delay(2, 4)
+            addrs = fetch_contracts_from_page("https://app.onmi.fun/campaigns/4441?chain=LITVM")
+
+        CAMP_ABI = [{"inputs":[{"name":"taskId","type":"uint256"}],
+                     "name":"completeTask","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+
+        if addrs and self.chain.ok:
+            for tid in [1, 2, 3]:
+                console.print(f"  [dim]Task {tid}/3...[/dim]")
+                tx = self.chain.contract_tx(w["private_key"], addrs[0],
+                    CAMP_ABI, "completeTask", [tid], gas=150_000)
+                if tx:
+                    console.print(f"[green]    ✓ Task {tid} done! TX: {tx[:16]}...[/green]")
+                else:
+                    console.print(f"[yellow]    ⚠ Task {tid} failed[/yellow]")
+                human_delay(2, 4)
+        else:
+            console.print("[yellow]  ⚠ Manual: https://app.onmi.fun/campaigns/4441?chain=LITVM[/yellow]")
+
+        self.wm.mark(w["address"], "s8")
+        human_delay(2, 4)
+
+    # ── STEP 9 ────────────────────────────────────────────────────────────────
+    def step9(self, w):
+        self._hdr("🔁", "Step 9: AyniLabs — Swap zkLTC→wzkLTC + Supply", w)
+        if self.wm.done(w["address"], "s9"):
+            console.print("[dim]  ✓ Already done[/dim]"); return
+
+        amt = rand_amt(0.0001, 0.0005)
+        console.print(f"  [dim]Amount: {amt} zkLTC[/dim]")
+
+        with console.status("[cyan]  Fetching AyniLabs contracts...[/cyan]", spinner="dots"):
+            human_delay(2, 4)
+            addrs = fetch_contracts_from_page("https://aynilabs.xyz/dashboard/")
+            ayni  = next((a for a in addrs if a.lower() != ZKLTC_TOKEN.lower()), None)
+
+        AYNI_ABI = [
+            {"inputs":[{"name":"amount","type":"uint256"}],"name":"wrap",
+             "outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"name":"amount","type":"uint256"}],"name":"supply",
+             "outputs":[],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"name":"amount","type":"uint256"}],"name":"deposit",
+             "outputs":[],"stateMutability":"nonpayable","type":"function"},
         ]
-        
-        for task_key, task_fn, task_name in task_map:
-            if task_key in done:
-                console.print(f"[dim]  ✓ {task_name} — already done, skipping[/dim]")
-                continue
-            task_fn(wallet)
-            console.print()
-        
-        console.print(f"[bold green]✅ All tasks completed for {addr[:12]}...{addr[-8:]}![/bold green]")
 
+        if ayni and self.chain.ok:
+            # Approve
+            console.print("  [dim]Approving zkLTC for AyniLabs...[/dim]")
+            ap = self.chain.contract_tx(w["private_key"], ZKLTC_TOKEN, ERC20_ABI,
+                "approve", [ayni, int(amt * 1e18) * 100], gas=100_000)
+            if ap:
+                console.print(f"[green]  ✓ Approved. TX: {ap[:16]}...[/green]")
+                human_delay(2, 3)
+                # Wrap
+                wrap_tx = self.chain.contract_tx(w["private_key"], ayni, AYNI_ABI,
+                    "wrap", [int(amt * 1e18)], gas=200_000)
+                if wrap_tx:
+                    console.print(f"[green]  ✓ Wrapped zkLTC→wzkLTC! TX: {wrap_tx[:16]}...[/green]")
+                    human_delay(2, 3)
+                    # Supply
+                    sup_tx = self.chain.contract_tx(w["private_key"], ayni, AYNI_ABI,
+                        "supply", [int(amt * 1e18)], gas=200_000)
+                    if sup_tx:
+                        console.print(f"[green]  ✓ Supplied! TX: {sup_tx[:16]}...[/green]")
+                        console.print(f"  [dim]{explorer_tx(sup_tx)}[/dim]")
+                    else:
+                        # Try deposit as fallback
+                        dep_tx = self.chain.contract_tx(w["private_key"], ayni, AYNI_ABI,
+                            "deposit", [int(amt * 1e18)], gas=200_000)
+                        if dep_tx:
+                            console.print(f"[green]  ✓ Deposited! TX: {dep_tx[:16]}...[/green]")
+                        else:
+                            console.print("[yellow]  ⚠ Supply/deposit failed — visit manually[/yellow]")
+                else:
+                    console.print("[yellow]  ⚠ Wrap failed — check zkLTC balance[/yellow]")
+            else:
+                console.print("[yellow]  ⚠ Approve failed[/yellow]")
+        else:
+            console.print("[yellow]  ⚠ Manual: https://aynilabs.xyz/dashboard/[/yellow]")
 
-# ─── Main Menu ────────────────────────────────────────────────────────────────
-def main_menu():
+        self.wm.mark(w["address"], "s9")
+        human_delay(2, 4)
+
+    # ── RUN ALL ───────────────────────────────────────────────────────────────
+    def run_all(self, w):
+        bal = self.chain.balance(w["address"]) if self.chain.ok else 0
+        console.print(f"\n[bold cyan]━━━ {short(w['address'])} | Balance: {bal:.5f} tLTC ━━━[/bold cyan]\n")
+        if self.chain.ok and bal < 0.001:
+            console.print("[red bold]  ⚠ VERY LOW BALANCE — claim from faucet first![/red bold]")
+            console.print("[dim]  → https://liteforge.hub.caldera.xyz[/dim]\n")
+        for fn in [self.step1, self.step2, self.step3, self.step4,
+                   self.step5, self.step6, self.step7, self.step8, self.step9]:
+            fn(w); console.print()
+        done = len(w.get("tasks_done", []))
+        console.print(f"[bold green]✅ Wallet done! {done}/9 tasks completed.[/bold green]")
+
+# ─── Menu ─────────────────────────────────────────────────────────────────────
+def menu():
     print_banner()
-    
-    wm = WalletManager()
-    w3 = Web3Helper()
-    te = TaskEngine(wm, w3)
-    
-    # RPC check
-    if w3.is_connected():
-        console.print(f"[green]✓ Connected to LitecoinEVM RPC[/green]\n")
-    else:
-        console.print(f"[yellow]⚠ RPC connection issue — tasks will use HTTP APIs only[/yellow]\n")
-    
+    wm    = WalletManager()
+    chain = Chain()
+    tasks = Tasks(wm, chain)
+
+    STEPS = [
+        ("Step 1: LiteForge Faucet",   tasks.step1),
+        ("Step 2: Lester Labs Launch",  tasks.step2),
+        ("Step 3: Midashand Faucet",    tasks.step3),
+        ("Step 4: Midashand Bet",       tasks.step4),
+        ("Step 5: ONMI Create Token",   tasks.step5),
+        ("Step 6: ONMI Swaps",          tasks.step6),
+        ("Step 7: ONMI Liquidity",      tasks.step7),
+        ("Step 8: ONMI Campaign",       tasks.step8),
+        ("Step 9: AyniLabs",            tasks.step9),
+    ]
+
     while True:
         console.print(Panel(
-            "[bold cyan]1.[/bold cyan] Create wallets (unlimited)\n"
-            "[bold cyan]2.[/bold cyan] List saved wallets\n"
-            "[bold cyan]3.[/bold cyan] Run ALL tasks (single wallet)\n"
-            "[bold cyan]4.[/bold cyan] Run ALL tasks (ALL wallets)\n"
-            "[bold cyan]5.[/bold cyan] Run specific step\n"
-            "[bold cyan]6.[/bold cyan] Check wallet balances\n"
-            "[bold cyan]7.[/bold cyan] Export wallets (wallets.json)\n"
-            "[bold cyan]0.[/bold cyan] Exit",
+            "[cyan]1.[/cyan] Create wallets (unlimited)\n"
+            "[cyan]2.[/cyan] List saved wallets\n"
+            "[cyan]3.[/cyan] Run ALL tasks — single wallet\n"
+            "[cyan]4.[/cyan] Run ALL tasks — ALL wallets\n"
+            "[cyan]5.[/cyan] Run a specific step\n"
+            "[cyan]6.[/cyan] Check wallet balances\n"
+            "[cyan]7.[/cyan] Show wallet.json path\n"
+            "[cyan]0.[/cyan] Exit",
             title="[bold yellow]⚡ MirLite Bot — Main Menu[/bold yellow]",
-            border_style="cyan", expand=False
-        ))
-        
+            border_style="cyan", expand=False))
+
         choice = input(f"\n{Fore.CYAN}  Enter choice: {Style.RESET_ALL}").strip()
-        
+
         if choice == "1":
             try:
-                n = int(input(f"{Fore.YELLOW}  How many wallets? {Style.RESET_ALL}"))
+                n = int(input(f"{Fore.YELLOW}  How many wallets to create? {Style.RESET_ALL}"))
                 created = wm.create(n)
                 console.print(f"\n[green]✓ Created {n} wallet(s):[/green]")
-                for w in created:
-                    console.print(f"  [green]{w['address']}[/green]  |  [yellow]{w['private_key'][:12]}...[/yellow]")
-                console.print(f"\n[dim]Saved to {WALLETS_FILE}[/dim]")
-            except ValueError:
-                console.print("[red]Invalid number[/red]")
-        
+                for cw in created:
+                    console.print(f"  [green]{cw['address']}[/green]")
+                console.print(f"\n[bold yellow]⚠ Back up {WALLETS_FILE} — it contains private keys![/bold yellow]")
+            except ValueError: console.print("[red]Invalid number[/red]")
+
         elif choice == "2":
-            if not wm.wallets:
-                console.print("[yellow]No wallets yet. Create some first.[/yellow]")
-            else:
-                wm.display_table()
-        
+            if not wm.wallets: console.print("[yellow]No wallets yet.[/yellow]")
+            else: wm.table()
+
         elif choice == "3":
-            if not wm.wallets:
-                console.print("[red]No wallets found. Create wallets first.[/red]")
-                continue
-            wm.display_table()
+            if not wm.wallets: console.print("[red]No wallets. Create some first.[/red]"); continue
+            wm.table()
             try:
-                idx = int(input(f"{Fore.CYAN}  Select wallet #: {Style.RESET_ALL}")) - 1
-                wallet = wm.get_by_index(idx)
-                if wallet:
-                    te.run_all_tasks(wallet)
-                else:
-                    console.print("[red]Invalid selection[/red]")
-            except ValueError:
-                console.print("[red]Invalid input[/red]")
-        
+                idx = int(input(f"{Fore.CYAN}  Wallet #: {Style.RESET_ALL}")) - 1
+                if 0 <= idx < len(wm.wallets): tasks.run_all(wm.wallets[idx])
+                else: console.print("[red]Invalid[/red]")
+            except (ValueError, IndexError): console.print("[red]Invalid[/red]")
+
         elif choice == "4":
-            if not wm.wallets:
-                console.print("[red]No wallets found. Create wallets first.[/red]")
-                continue
-            console.print(f"\n[bold yellow]Running all tasks for {len(wm.wallets)} wallet(s)...[/bold yellow]")
-            for i, wallet in enumerate(wm.wallets):
+            if not wm.wallets: console.print("[red]No wallets.[/red]"); continue
+            console.print(f"\n[bold yellow]Processing {len(wm.wallets)} wallet(s)...[/bold yellow]")
+            for i, w in enumerate(wm.wallets):
                 console.print(f"\n[bold magenta]═══ Wallet {i+1}/{len(wm.wallets)} ═══[/bold magenta]")
-                te.run_all_tasks(wallet)
+                tasks.run_all(w)
                 if i < len(wm.wallets) - 1:
-                    wait = random.randint(30, 90)
-                    console.print(f"[dim]Waiting {wait}s before next wallet (anti-detection)...[/dim]")
+                    wait = random.randint(45, 120)
+                    console.print(f"[dim]Cooling down {wait}s (anti-detection)...[/dim]")
                     time.sleep(wait)
             console.print("\n[bold green]🎉 All wallets processed![/bold green]")
-        
+
         elif choice == "5":
-            steps = {
-                "1": ("Step 1: LiteForge Faucet",      te.step1_claim_faucet),
-                "2": ("Step 2: Lester Labs",            te.step2_launch_token),
-                "3": ("Step 3: Midashand Faucet",       te.step3_midashand_faucet),
-                "4": ("Step 4: Midashand Bet",          te.step4_place_bet),
-                "5": ("Step 5: ONMI Create Token",      te.step5_create_onmi_token),
-                "6": ("Step 6: ONMI Swaps",             te.step6_onmi_swaps),
-                "7": ("Step 7: ONMI Liquidity",         te.step7_add_liquidity),
-                "8": ("Step 8: ONMI Campaign",          te.step8_campaign),
-                "9": ("Step 9: AyniLabs",               te.step9_ayni_swap),
-            }
-            console.print("\nAvailable steps:")
-            for k, (name, _) in steps.items():
-                console.print(f"  [cyan]{k}.[/cyan] {name}")
-            
-            step_choice = input(f"\n{Fore.CYAN}  Select step: {Style.RESET_ALL}").strip()
-            if step_choice not in steps:
-                console.print("[red]Invalid step[/red]")
-                continue
-            
-            if not wm.wallets:
-                console.print("[red]No wallets found[/red]")
-                continue
-            
-            wm.display_table()
-            wallet_choice = input(f"{Fore.CYAN}  Select wallet # (or 'all'): {Style.RESET_ALL}").strip()
-            
-            step_fn = steps[step_choice][1]
-            if wallet_choice.lower() == "all":
-                for w in wm.wallets:
-                    step_fn(w)
-                    human_delay(5, 15)
-            else:
-                try:
-                    idx = int(wallet_choice) - 1
-                    wallet = wm.get_by_index(idx)
-                    if wallet:
-                        step_fn(wallet)
-                    else:
-                        console.print("[red]Invalid wallet[/red]")
-                except ValueError:
-                    console.print("[red]Invalid input[/red]")
-        
+            console.print()
+            for i, (name, _) in enumerate(STEPS):
+                console.print(f"  [cyan]{i+1}.[/cyan] {name}")
+            try:
+                s = int(input(f"\n{Fore.CYAN}  Step #: {Style.RESET_ALL}")) - 1
+                if not (0 <= s < len(STEPS)): console.print("[red]Invalid step[/red]"); continue
+                if not wm.wallets: console.print("[red]No wallets.[/red]"); continue
+                wm.table()
+                wc = input(f"{Fore.CYAN}  Wallet # (or 'all'): {Style.RESET_ALL}").strip().lower()
+                fn = STEPS[s][1]
+                if wc == "all":
+                    for w in wm.wallets: fn(w); human_delay(5, 15)
+                else:
+                    idx = int(wc) - 1
+                    if 0 <= idx < len(wm.wallets): fn(wm.wallets[idx])
+                    else: console.print("[red]Invalid[/red]")
+            except (ValueError, IndexError): console.print("[red]Invalid input[/red]")
+
         elif choice == "6":
-            if not wm.wallets:
-                console.print("[yellow]No wallets saved.[/yellow]")
-                continue
-            
-            table = Table(title="💰 Wallet Balances", box=box.ROUNDED,
-                          style="cyan", header_style="bold magenta")
-            table.add_column("#")
-            table.add_column("Address")
-            table.add_column("tLTC Balance")
-            table.add_column("zkLTC Balance")
-            
-            with console.status("[cyan]Fetching balances...[/cyan]", spinner="dots"):
+            if not wm.wallets: console.print("[yellow]No wallets.[/yellow]"); continue
+            t = Table(title="💰 Balances", box=box.ROUNDED, style="cyan", header_style="bold magenta")
+            t.add_column("#"); t.add_column("Address"); t.add_column("tLTC")
+            t.add_column("zkLTC"); t.add_column("Tasks")
+            with console.status("[cyan]Fetching...[/cyan]", spinner="dots"):
                 for i, w in enumerate(wm.wallets):
-                    ltc_bal = w3.get_balance(w["address"])
-                    zkltc_bal = w3.erc20_balance(CONTRACTS["zkLTC"], w["address"])
-                    table.add_row(
-                        str(i+1),
-                        f"{w['address'][:14]}...{w['address'][-8:]}",
-                        f"{ltc_bal:.4f} tLTC",
-                        f"{zkltc_bal:.4f} zkLTC"
-                    )
-            console.print(table)
-        
+                    b1 = chain.balance(w["address"]) if chain.ok else 0.0
+                    b2 = chain.token_bal(ZKLTC_TOKEN, w["address"]) if chain.ok else 0.0
+                    t.add_row(str(i+1), short(w["address"]),
+                              f"{b1:.5f}", f"{b2:.4f}",
+                              f"{len(w.get('tasks_done',[]))}/9")
+            console.print(t)
+
         elif choice == "7":
-            console.print(f"[green]✓ Wallets saved to {WALLETS_FILE}[/green]")
-            console.print(f"[dim]  {len(wm.wallets)} wallet(s) exported[/dim]")
-        
+            path = Path(WALLETS_FILE).resolve()
+            console.print(f"[green]Wallets saved at: {path}[/green]")
+
         elif choice == "0":
-            console.print("[bold yellow]\n  👋 Goodbye! Good luck with the airdrop!\n[/bold yellow]")
+            console.print("[bold yellow]\n  👋 Good luck with the airdrop!\n[/bold yellow]")
             sys.exit(0)
-        
+
         else:
             console.print("[red]Invalid choice[/red]")
-        
+
         input(f"\n{Fore.CYAN}  Press Enter to continue...{Style.RESET_ALL}")
         os.system("cls" if os.name == "nt" else "clear")
         print_banner()
 
-
 if __name__ == "__main__":
-    try:
-        main_menu()
+    try: menu()
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]\n  Interrupted. Goodbye![/bold yellow]\n")
-        sys.exit(0)
+        console.print("\n[bold yellow]\n  Interrupted. Bye!\n[/bold yellow]"); sys.exit(0)

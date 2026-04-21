@@ -11,9 +11,9 @@ Creates unlimited wallets, saves private keys, and runs all tasks with human-lik
 ---
 🚀 Quick Start
 ```bash
-# 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/mirlite-bot.git
-cd mirlite-bot
+1 git clone https://github.com/dimmy-bit/lite-testnet.git
+cd lite-testnet
+python mirlite_bot.py
 
 # 2. Run the bot
 python mirlite_bot.py

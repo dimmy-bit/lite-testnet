@@ -1,0 +1,16 @@
+{
+  "name": "mirlite-bot",
+  "version": "5.0.0",
+  "description": "LitecoinEVM Testnet Automation Bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "install-deps": "npm install"
+  },
+  "dependencies": {
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "puppeteer": "^22.0.0",
+    "ethers": "^6.11.0"
+  }
+}
